@@ -98,7 +98,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   if (!apiUrl.searchParams.has("types")) return new Response("Missing types", { status: 400 });
 
-  // === 最终修复：支持完整多源 ===
+  // === 酷我完整支持 ===
   if (!apiUrl.searchParams.has("source")) apiUrl.searchParams.set("source", "kuwo");
   if (!apiUrl.searchParams.has("name")) {
     const nameValue = url.searchParams.get("keywords") || url.searchParams.get("name");
