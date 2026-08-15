@@ -13,18 +13,6 @@ const SAFE_RESPONSE_HEADERS = [
   "expires",
 ];
 
-const EXPOSED_HEADERS = [
-  "Content-Type",
-  "Content-Length",
-  "Content-Range",
-  "Accept-Ranges",
-  "Cache-Control",
-  "ETag",
-  "Last-Modified",
-  "Expires",
-  "X-Cache-Status",
-];
-
 
 // ============================================================
 // CORS
@@ -35,7 +23,11 @@ function createCorsHeaders(init?: Headers): Headers {
 
   if (init) {
     for (const [key, value] of init.entries()) {
-      if (SAFE_RESPONSE_HEADERS.includes(key.toLowerCase())) {
+      if (
+        SAFE_RESPONSE_HEADERS.includes(
+          key.toLowerCase()
+        )
+      ) {
         headers.set(key, value);
       }
     }
@@ -45,11 +37,24 @@ function createCorsHeaders(init?: Headers): Headers {
     headers.set("Cache-Control", "no-store");
   }
 
-  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
 
   headers.set(
     "Access-Control-Expose-Headers",
-    EXPOSED_HEADERS.join(", ")
+    [
+      "Content-Type",
+      "Content-Length",
+      "Content-Range",
+      "Accept-Ranges",
+      "Cache-Control",
+      "ETag",
+      "Last-Modified",
+      "Expires",
+      "X-Cache-Status",
+    ].join(", ")
   );
 
   return headers;
@@ -62,10 +67,9 @@ function handleOptions(): Response {
 
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+      "Access-Control-Allow-Methods":
+        "GET,HEAD,OPTIONS",
       "Access-Control-Allow-Headers": "*",
-      "Access-Control-Expose-Headers":
-        EXPOSED_HEADERS.join(", "),
       "Access-Control-Max-Age": "86400",
     },
   });
@@ -73,25 +77,32 @@ function handleOptions(): Response {
 
 
 // ============================================================
-// 酷我 URL 校验
+// 酷我 HOST 校验
 // ============================================================
 
-function isAllowedKuwoHost(hostname: string): boolean {
+function isAllowedKuwoHost(
+  hostname: string
+): boolean {
   if (!hostname) return false;
 
-  return KUWO_HOST_PATTERN.test(hostname);
+  return KUWO_HOST_PATTERN.test(
+    hostname
+  );
 }
 
 
-function normalizeKuwoUrl(rawUrl: string): URL | null {
+function normalizeKuwoUrl(
+  rawUrl: string
+): URL | null {
+
   try {
     const parsed = new URL(rawUrl);
 
-    if (!isAllowedKuwoHost(parsed.hostname)) {
-      console.warn(
-        `[KUWO] Blocked host: ${parsed.hostname}`
-      );
-
+    if (
+      !isAllowedKuwoHost(
+        parsed.hostname
+      )
+    ) {
       return null;
     }
 
@@ -99,204 +110,486 @@ function normalizeKuwoUrl(rawUrl: string): URL | null {
       parsed.protocol !== "http:" &&
       parsed.protocol !== "https:"
     ) {
-      console.warn(
-        `[KUWO] Blocked protocol: ${parsed.protocol}`
-      );
-
       return null;
     }
 
+    /*
+     * 不再强制把 HTTPS 改成 HTTP。
+     *
+     * 之前我们这里强制：
+     * parsed.protocol = "http:";
+     *
+     * 可能导致某些酷我 CDN 的请求异常。
+     *
+     * 现在保留酷我返回的原始协议。
+     */
+
     return parsed;
 
-  } catch (err) {
-    console.warn(
-      "[KUWO] Invalid URL:",
-      rawUrl,
-      err
-    );
-
+  } catch {
     return null;
   }
 }
 
 
 // ============================================================
-// 酷我播放地址解析
-//
-// 重点：
-//
-// 之前：
-// convert_url3 + mp3
-//
-// 出现了所有歌曲只有约 11 秒的问题。
-//
-// 现在：
-// 1. convert_url + mp3
-// 2. convert_url + aac|mp3
-// 3. convert_url3 + mp3
-// 4. convert_url3 + wma
-//
-// 按顺序尝试。
+// 工具：从酷我 XML 中提取字段
 // ============================================================
 
-async function requestKuwoAntiServer(
-  songId: string,
-  type: string,
-  format: string
+function getXmlValue(
+  xml: string,
+  tag: string
+): string {
+
+  const pattern =
+    new RegExp(
+      `<${tag}>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    );
+
+  const match =
+    xml.match(pattern);
+
+  if (!match) {
+    return "";
+  }
+
+  return match[1]
+    .trim()
+    .replace(
+      /&amp;/g,
+      "&"
+    )
+    .replace(
+      /&lt;/g,
+      "<"
+    )
+    .replace(
+      /&gt;/g,
+      ">"
+    )
+    .replace(
+      /&quot;/g,
+      '"'
+    )
+    .replace(
+      /&#39;/g,
+      "'"
+    );
+}
+
+
+// ============================================================
+// 酷我方案一：
+// getNewMuiseByRid
+//
+// 这是本次最主要的修改。
+//
+// 请求：
+// https://player.kuwo.cn/webmusic/st/getNewMuiseByRid?rid=MUSIC_歌曲ID
+//
+// 返回 XML，其中包含：
+// <mp3dl>...</mp3dl>
+// <mp3path>...</mp3path>
+//
+// 最终：
+// https://mp3dl/resource/mp3path
+// ============================================================
+
+async function getKuwoSongInfo(
+  songId: string
+): Promise<{
+  url: string;
+  br: number;
+  size: number;
+} | null> {
+
+  const rid = songId.startsWith("MUSIC_")
+    ? songId
+    : `MUSIC_${songId}`;
+
+  const endpoints = [
+    `https://player.kuwo.cn/webmusic/st/getNewMuiseByRid?rid=${encodeURIComponent(rid)}`,
+    `https://player.kuwo.cn/webmusic/st/getMuiseByRid?rid=${encodeURIComponent(rid)}&flag=3`,
+  ];
+
+  for (const endpoint of endpoints) {
+
+    console.log(
+      `[KUWO INFO] Request: ${endpoint}`
+    );
+
+    try {
+
+      const response =
+        await fetch(
+          endpoint,
+          {
+            method: "GET",
+
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+
+              "Accept":
+                "application/xml,text/xml,text/plain,*/*",
+
+              "Referer":
+                "https://www.kuwo.cn/",
+            },
+
+            redirect: "follow",
+          }
+        );
+
+      const text =
+        await response.text();
+
+      console.log(
+        `[KUWO INFO] HTTP ${response.status}, length=${text.length}`
+      );
+
+      if (!response.ok) {
+        continue;
+      }
+
+      if (!text.trim()) {
+        continue;
+      }
+
+
+      // ------------------------------------------------------
+      // 判断是否真的拿到了 Song
+      // ------------------------------------------------------
+
+      const musicId =
+        getXmlValue(
+          text,
+          "music_id"
+        );
+
+      if (!musicId) {
+
+        console.warn(
+          "[KUWO INFO] No music_id in response"
+        );
+
+        continue;
+      }
+
+
+      // ------------------------------------------------------
+      // MP3 下载服务器
+      // ------------------------------------------------------
+
+      const mp3dl =
+        getXmlValue(
+          text,
+          "mp3dl"
+        );
+
+      const mp3path =
+        getXmlValue(
+          text,
+          "mp3path"
+        );
+
+
+      console.log(
+        `[KUWO INFO] music_id=${musicId}`
+      );
+
+      console.log(
+        `[KUWO INFO] mp3dl=${mp3dl}`
+      );
+
+      console.log(
+        `[KUWO INFO] mp3path=${mp3path}`
+      );
+
+
+      if (
+        !mp3dl ||
+        !mp3path
+      ) {
+
+        console.warn(
+          "[KUWO INFO] MP3 fields missing"
+        );
+
+        continue;
+      }
+
+
+      // ------------------------------------------------------
+      // 清理地址
+      // ------------------------------------------------------
+
+      let host =
+        mp3dl.trim();
+
+      let path =
+        mp3path.trim();
+
+
+      // 有些返回值可能已经带协议
+      host =
+        host.replace(
+          /^https?:\/\//i,
+          ""
+        );
+
+      // 防止重复 /
+      host =
+        host.replace(
+          /\/+$/,
+          ""
+        );
+
+      path =
+        path.replace(
+          /^\/+/,
+          ""
+        );
+
+
+      const audioUrl =
+        `https://${host}/resource/${path}`;
+
+
+      console.log(
+        `[KUWO INFO] Constructed MP3 URL: ${audioUrl}`
+      );
+
+
+      // ------------------------------------------------------
+      // 获取歌曲码率
+      //
+      // mp3path 中通常包含：
+      //
+      // n2/128/...
+      // n1/320/...
+      //
+      // 尝试从路径中识别。
+      // ------------------------------------------------------
+
+      let bitrate = 128;
+
+      const bitrateMatch =
+        path.match(
+          /\/(320|256|192|128|64)\//
+        );
+
+      if (bitrateMatch) {
+        bitrate =
+          Number(
+            bitrateMatch[1]
+          );
+      }
+
+
+      // ------------------------------------------------------
+      // 获取文件大小
+      // ------------------------------------------------------
+
+      let size = 0;
+
+      const mp3size =
+        getXmlValue(
+          text,
+          "mp3size"
+        );
+
+      if (mp3size) {
+
+        const sizeMatch =
+          mp3size.match(
+            /([\d.]+)\s*(KB|MB|GB)/i
+          );
+
+        if (sizeMatch) {
+
+          const value =
+            Number(
+              sizeMatch[1]
+            );
+
+          const unit =
+            sizeMatch[2]
+              .toUpperCase();
+
+          if (unit === "KB") {
+            size =
+              Math.round(
+                value * 1024
+              );
+          }
+
+          if (unit === "MB") {
+            size =
+              Math.round(
+                value * 1024 * 1024
+              );
+          }
+
+          if (unit === "GB") {
+            size =
+              Math.round(
+                value *
+                1024 *
+                1024 *
+                1024
+              );
+          }
+        }
+      }
+
+
+      return {
+        url: audioUrl,
+        br: bitrate,
+        size,
+      };
+
+    } catch (err) {
+
+      console.warn(
+        "[KUWO INFO] Request failed:",
+        err
+      );
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================
+// 酷我方案二：
+// antiserver convert_url
+//
+// 作为备用。
+// ============================================================
+
+async function getKuwoAntiServerUrl(
+  songId: string
 ): Promise<string | null> {
 
-  const url = new URL(
-    "https://antiserver.kuwo.cn/anti.s"
-  );
+  const rid =
+    songId.startsWith("MUSIC_")
+      ? songId
+      : `MUSIC_${songId}`;
+
+  const url =
+    new URL(
+      "https://antiserver.kuwo.cn/anti.s"
+    );
 
   url.searchParams.set(
     "type",
-    type
+    "convert_url"
   );
 
   url.searchParams.set(
     "rid",
-    songId
+    rid
   );
 
   url.searchParams.set(
     "format",
-    format
+    "aac|mp3"
   );
 
-  // convert_url 使用 response=url
-  if (type === "convert_url") {
-    url.searchParams.set(
-      "response",
-      "url"
-    );
-  }
+  url.searchParams.set(
+    "response",
+    "url"
+  );
+
 
   console.log(
-    `[KUWO] Request ${type}/${format}: ${url.toString()}`
+    `[KUWO ANTI] Request: ${url.toString()}`
   );
+
 
   try {
 
-    const response = await fetch(
-      url.toString(),
-      {
-        method: "GET",
+    const response =
+      await fetch(
+        url.toString(),
+        {
+          method: "GET",
 
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
 
-          "Accept": "*/*",
+            "Accept":
+              "*/*",
 
-          "Referer":
-            "https://www.kuwo.cn/",
-        },
+            "Referer":
+              "https://www.kuwo.cn/",
+          },
 
-        redirect: "follow",
-      }
-    );
+          redirect: "follow",
+        }
+      );
 
-    const text = (
-      await response.text()
-    ).trim();
+
+    const text =
+      (
+        await response.text()
+      ).trim();
+
 
     console.log(
-      `[KUWO] ${type}/${format} HTTP ${response.status}: ${text.substring(
-        0,
-        500
-      )}`
+      `[KUWO ANTI] HTTP ${response.status}: ${text.substring(0, 500)}`
     );
+
 
     if (!response.ok) {
       return null;
     }
 
-    if (!text) {
-      return null;
-    }
-
-
-    // --------------------------------------------------------
-    // 直接返回 URL
-    // --------------------------------------------------------
 
     if (
-      text.startsWith("http://") ||
-      text.startsWith("https://")
+      text.startsWith(
+        "http://"
+      ) ||
+      text.startsWith(
+        "https://"
+      )
     ) {
+
       return text;
     }
 
 
-    // --------------------------------------------------------
-    // IPDeny
-    // --------------------------------------------------------
-
-    if (
-      text === "IPDeny" ||
-      text === "IP_DENY"
-    ) {
-      console.warn(
-        `[KUWO] IPDeny returned by ${type}/${format}`
-      );
-
-      return null;
-    }
-
-
-    // --------------------------------------------------------
-    // JSON 返回
-    //
-    // 例如：
-    // {
-    //   "code":"200",
-    //   "url":"https://..."
-    // }
-    // --------------------------------------------------------
-
     try {
 
-      const data = JSON.parse(text);
+      const data =
+        JSON.parse(text);
 
       if (
         data &&
-        typeof data.url === "string" &&
-        (
-          data.url.startsWith("http://") ||
-          data.url.startsWith("https://")
+        typeof data.url ===
+          "string" &&
+        data.url.startsWith(
+          "http"
         )
       ) {
 
         return data.url;
       }
 
-
-      if (
-        data &&
-        data.data &&
-        typeof data.data.url === "string" &&
-        (
-          data.data.url.startsWith("http://") ||
-          data.data.url.startsWith("https://")
-        )
-      ) {
-
-        return data.data.url;
-      }
-
     } catch {
-      // 不是 JSON，继续处理
+      // 非 JSON，继续
     }
 
 
-    // --------------------------------------------------------
-    // 从文本中提取 URL
-    // --------------------------------------------------------
-
-    const match = text.match(
-      /https?:\/\/[^\s"'<>]+/
-    );
+    const match =
+      text.match(
+        /https?:\/\/[^\s"'<>]+/
+      );
 
     if (match) {
       return match[0];
@@ -305,238 +598,20 @@ async function requestKuwoAntiServer(
   } catch (err) {
 
     console.warn(
-      `[KUWO] ${type}/${format} request failed:`,
+      "[KUWO ANTI] Failed:",
       err
     );
   }
 
-  return null;
-}
-
-
-// ============================================================
-// 获取酷我实际播放 URL
-// ============================================================
-
-async function getKuwoDirectUrl(
-  songId: string,
-  requestedBr: string | null
-): Promise<{
-  url: string;
-  br: number;
-} | null> {
-
-  if (!songId) {
-    return null;
-  }
-
-  let cleanId = songId.trim();
-
-  if (!cleanId) {
-    return null;
-  }
-
-
-  // ----------------------------------------------------------
-  // 酷我很多接口使用 MUSIC_XXXXXXXX 格式。
-  //
-  // 如果前端只传：
-  // 113118
-  //
-  // 我们优先使用：
-  // MUSIC_113118
-  //
-  // 如果失败，再使用原始：
-  // 113118
-  // ----------------------------------------------------------
-
-  const ids: string[] = [];
-
-  if (cleanId.startsWith("MUSIC_")) {
-    ids.push(cleanId);
-
-    const numericId =
-      cleanId.substring(6);
-
-    if (numericId) {
-      ids.push(numericId);
-    }
-
-  } else {
-    ids.push(
-      `MUSIC_${cleanId}`
-    );
-
-    ids.push(cleanId);
-  }
-
-
-  // 去重
-  const uniqueIds = [
-    ...new Set(ids)
-  ];
-
-
-  // ----------------------------------------------------------
-  // 记录请求码率
-  // ----------------------------------------------------------
-
-  let requestedBitrate = 128;
-
-  if (requestedBr) {
-    const parsed =
-      Number(requestedBr);
-
-    if (
-      Number.isFinite(parsed) &&
-      parsed > 0
-    ) {
-      requestedBitrate = parsed;
-    }
-  }
-
-
-  // ==========================================================
-  // 第一优先级
-  //
-  // convert_url + mp3
-  //
-  // 这是目前最值得优先尝试的旧版酷我播放接口。
-  // ==========================================================
-
-  for (const rid of uniqueIds) {
-
-    const url =
-      await requestKuwoAntiServer(
-        rid,
-        "convert_url",
-        "mp3"
-      );
-
-    if (url) {
-
-      console.log(
-        `[KUWO] SUCCESS convert_url/mp3 RID=${rid}`
-      );
-
-      return {
-        url,
-        br: requestedBitrate,
-      };
-    }
-  }
-
-
-  // ==========================================================
-  // 第二优先级
-  //
-  // convert_url + aac|mp3
-  //
-  // 某些酷我接口版本会根据这个参数选择可用格式。
-  // ==========================================================
-
-  for (const rid of uniqueIds) {
-
-    const url =
-      await requestKuwoAntiServer(
-        rid,
-        "convert_url",
-        "aac|mp3"
-      );
-
-    if (url) {
-
-      console.log(
-        `[KUWO] SUCCESS convert_url/aac|mp3 RID=${rid}`
-      );
-
-      return {
-        url,
-        br: requestedBitrate,
-      };
-    }
-  }
-
-
-  // ==========================================================
-  // 第三优先级
-  //
-  // convert_url3 + mp3
-  //
-  // 这是之前实际能拿到 URL 的方式。
-  // 保留作为 fallback。
-  // ==========================================================
-
-  for (const rid of uniqueIds) {
-
-    const url =
-      await requestKuwoAntiServer(
-        rid,
-        "convert_url3",
-        "mp3"
-      );
-
-    if (url) {
-
-      console.log(
-        `[KUWO] SUCCESS convert_url3/mp3 RID=${rid}`
-      );
-
-      return {
-        url,
-        br: requestedBitrate,
-      };
-    }
-  }
-
-
-  // ==========================================================
-  // 第四优先级
-  //
-  // convert_url3 + wma
-  //
-  // 某些新版酷我接口仍然可以通过 WMA 获取完整资源。
-  //
-  // 但浏览器不一定支持 WMA，所以只作为最后 fallback。
-  // ==========================================================
-
-  for (const rid of uniqueIds) {
-
-    const url =
-      await requestKuwoAntiServer(
-        rid,
-        "convert_url3",
-        "wma"
-      );
-
-    if (url) {
-
-      console.log(
-        `[KUWO] SUCCESS convert_url3/wma RID=${rid}`
-      );
-
-      return {
-        url,
-        br: requestedBitrate,
-      };
-    }
-  }
-
-
-  console.warn(
-    `[KUWO] All playback methods failed for song ${cleanId}`
-  );
 
   return null;
 }
 
 
 // ============================================================
-// 酷我：types=url
+// 酷我 types=url
 //
 // /proxy?types=url&id=113118&source=kuwo&br=320
-//
-// 这里不再请求 GD Studio。
 // ============================================================
 
 async function proxyKuwoUrlRequest(
@@ -545,10 +620,14 @@ async function proxyKuwoUrlRequest(
 ): Promise<Response> {
 
   const songId =
-    url.searchParams.get("id");
+    url.searchParams.get(
+      "id"
+    );
 
-  const br =
-    url.searchParams.get("br");
+  const requestedBr =
+    url.searchParams.get(
+      "br"
+    );
 
 
   if (!songId) {
@@ -559,18 +638,15 @@ async function proxyKuwoUrlRequest(
         br: -1,
         size: 0,
         from: "kuwo-direct",
-        error: "Missing song id",
+        error:
+          "Missing song id",
       }),
-
       {
         status: 400,
 
         headers: {
           "Access-Control-Allow-Origin":
             "*",
-
-          "Access-Control-Expose-Headers":
-            "Content-Type",
 
           "Content-Type":
             "application/json; charset=utf-8",
@@ -583,29 +659,40 @@ async function proxyKuwoUrlRequest(
   }
 
 
-  const result =
-    await getKuwoDirectUrl(
-      songId,
-      br
+  console.log(
+    `[KUWO] Resolving song: ${songId}, requested br=${requestedBr}`
+  );
+
+
+  // ==========================================================
+  // 第一优先级：
+  // getNewMuiseByRid
+  // ==========================================================
+
+  const songInfo =
+    await getKuwoSongInfo(
+      songId
     );
 
 
-  if (!result) {
+  if (songInfo) {
 
-    console.warn(
-      `[KUWO] Failed to resolve playback URL for ${songId}`
+    console.log(
+      `[KUWO] SUCCESS via getNewMuiseByRid: ${songInfo.url}`
     );
+
 
     return new Response(
       JSON.stringify({
-        url: "",
-        br: -1,
-        size: 0,
-        from: "kuwo-direct",
-        error:
-          "Kuwo playback URL unavailable",
-      }),
+        url: songInfo.url,
 
+        br: songInfo.br,
+
+        size: songInfo.size,
+
+        from:
+          "kuwo-song-info",
+      }),
       {
         status: 200,
 
@@ -627,25 +714,91 @@ async function proxyKuwoUrlRequest(
   }
 
 
-  console.log(
-    `[KUWO] Playback URL resolved: ${result.url}`
+  // ==========================================================
+  // 第二优先级：
+  // antiserver
+  // ==========================================================
+
+  const antiUrl =
+    await getKuwoAntiServerUrl(
+      songId
+    );
+
+
+  if (antiUrl) {
+
+    console.log(
+      `[KUWO] SUCCESS via antiserver: ${antiUrl}`
+    );
+
+
+    let bitrate =
+      requestedBr
+        ? Number(requestedBr)
+        : 128;
+
+
+    if (
+      !Number.isFinite(
+        bitrate
+      ) ||
+      bitrate <= 0
+    ) {
+      bitrate = 128;
+    }
+
+
+    return new Response(
+      JSON.stringify({
+        url: antiUrl,
+
+        br: bitrate,
+
+        size: 0,
+
+        from:
+          "kuwo-antiserver",
+      }),
+      {
+        status: 200,
+
+        headers: {
+          "Access-Control-Allow-Origin":
+            "*",
+
+          "Access-Control-Expose-Headers":
+            "Content-Type",
+
+          "Content-Type":
+            "application/json; charset=utf-8",
+
+          "Cache-Control":
+            "no-store, no-cache, must-revalidate",
+        },
+      }
+    );
+  }
+
+
+  // ==========================================================
+  // 全部失败
+  // ==========================================================
+
+  console.warn(
+    `[KUWO] Unable to resolve playback URL: ${songId}`
   );
 
 
-  const responseData = {
-    url: result.url,
-
-    br: result.br,
-
-    size: 0,
-
-    from: "kuwo-direct",
-  };
-
-
   return new Response(
-    JSON.stringify(responseData),
-
+    JSON.stringify({
+      url: "",
+      br: -1,
+      size: 0,
+      from:
+        "kuwo-direct",
+      error:
+        "Kuwo playback URL unavailable",
+    }),
     {
       status: 200,
 
@@ -672,7 +825,7 @@ async function proxyKuwoUrlRequest(
 //
 // /proxy?target=https://xxx.kuwo.cn/xxx.mp3
 //
-// Range 对 HTML5 Audio 很重要。
+// 保留 Range，确保 HTML5 Audio 正常。
 // ============================================================
 
 async function proxyKuwoAudio(
@@ -689,7 +842,7 @@ async function proxyKuwoAudio(
   if (!normalized) {
 
     return new Response(
-      "Invalid Kuwo target",
+      "Invalid target",
       {
         status: 400,
 
@@ -705,73 +858,113 @@ async function proxyKuwoAudio(
   }
 
 
-  const requestHeaders =
+  const headers =
     new Headers();
 
 
-  requestHeaders.set(
+  headers.set(
     "User-Agent",
     request.headers.get(
       "User-Agent"
     ) ??
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+      "Mozilla/5.0"
   );
 
 
-  requestHeaders.set(
+  headers.set(
     "Referer",
     "https://www.kuwo.cn/"
   );
 
 
-  requestHeaders.set(
+  headers.set(
     "Accept",
     request.headers.get(
       "Accept"
-    ) ?? "*/*"
+    ) ??
+      "*/*"
   );
 
 
-  const rangeHeader =
+  const range =
     request.headers.get(
       "Range"
     );
 
 
-  if (rangeHeader) {
+  if (range) {
 
-    requestHeaders.set(
+    headers.set(
       "Range",
-      rangeHeader
+      range
     );
   }
 
 
   console.log(
-    `[KUWO AUDIO] Fetching: ${normalized.toString()}${
-      rangeHeader
-        ? ` Range=${rangeHeader}`
-        : ""
-    }`
+    `[KUWO AUDIO] ${request.method} ${normalized.toString()}`
   );
 
 
-  let upstream: Response;
+  if (range) {
+
+    console.log(
+      `[KUWO AUDIO] Range: ${range}`
+    );
+  }
 
 
   try {
 
-    upstream = await fetch(
-      normalized.toString(),
+    const upstream =
+      await fetch(
+        normalized.toString(),
+        {
+          method:
+            request.method,
+
+          headers,
+
+          redirect:
+            "follow",
+        }
+      );
+
+
+    console.log(
+      `[KUWO AUDIO] Upstream: ${upstream.status} ${upstream.statusText}`
+    );
+
+
+    const responseHeaders =
+      createCorsHeaders(
+        upstream.headers
+      );
+
+
+    if (
+      upstream.status === 200 ||
+      upstream.status === 206
+    ) {
+
+      responseHeaders.set(
+        "Cache-Control",
+        "public, max-age=3600"
+      );
+    }
+
+
+    return new Response(
+      upstream.body,
       {
-        method:
-          request.method,
+        status:
+          upstream.status,
+
+        statusText:
+          upstream.statusText,
 
         headers:
-          requestHeaders,
-
-        redirect:
-          "follow",
+          responseHeaders,
       }
     );
 
@@ -781,6 +974,7 @@ async function proxyKuwoAudio(
       "[KUWO AUDIO] Fetch failed:",
       err
     );
+
 
     return new Response(
       "Kuwo upstream fetch failed",
@@ -797,73 +991,14 @@ async function proxyKuwoAudio(
       }
     );
   }
-
-
-  console.log(
-    `[KUWO AUDIO] Upstream response: ${upstream.status} ${upstream.statusText}`
-  );
-
-
-  const headers =
-    createCorsHeaders(
-      upstream.headers
-    );
-
-
-  // ----------------------------------------------------------
-  // 音频缓存
-  // ----------------------------------------------------------
-
-  if (
-    upstream.status === 200 ||
-    upstream.status === 206
-  ) {
-
-    headers.set(
-      "Cache-Control",
-      "public, max-age=3600"
-    );
-  }
-
-
-  if (
-    request.method === "HEAD"
-  ) {
-
-    return new Response(
-      null,
-      {
-        status:
-          upstream.status,
-
-        statusText:
-          upstream.statusText,
-
-        headers,
-      }
-    );
-  }
-
-
-  return new Response(
-    upstream.body,
-    {
-      status:
-        upstream.status,
-
-      statusText:
-        upstream.statusText,
-
-      headers,
-    }
-  );
 }
 
 
 // ============================================================
-// GD Studio API
+// 其他 API
 //
-// 网易云等其他源继续走这里。
+// 这里尽量恢复你最开始的版本。
+// 网易云、JOOX、酷狗等继续走 GD Studio。
 // ============================================================
 
 async function proxyApiRequest(
@@ -884,14 +1019,9 @@ async function proxyApiRequest(
     );
 
 
-  // s 是随机参数，不应该影响缓存
+  // 随机参数不参与缓存
   cacheUrl.searchParams.delete(
     "s"
-  );
-
-  // nocache 也不应该进入缓存 key
-  cacheUrl.searchParams.delete(
-    "nocache"
   );
 
 
@@ -941,7 +1071,7 @@ async function proxyApiRequest(
 
         response.headers.set(
           "Access-Control-Expose-Headers",
-          EXPOSED_HEADERS.join(", ")
+          "X-Cache-Status"
         );
 
 
@@ -964,7 +1094,7 @@ async function proxyApiRequest(
 
 
   // ==========================================================
-  // 构造 GD Studio API
+  // GD Studio API
   // ==========================================================
 
   const apiUrl =
@@ -979,8 +1109,7 @@ async function proxyApiRequest(
       if (
         key === "target" ||
         key === "callback" ||
-        key === "s" ||
-        key === "nocache"
+        key === "s"
       ) {
         return;
       }
@@ -1008,16 +1137,18 @@ async function proxyApiRequest(
         headers: {
           "Access-Control-Allow-Origin":
             "*",
-
-          "Content-Type":
-            "text/plain; charset=utf-8",
         },
       }
     );
   }
 
 
-  // 默认源：酷我
+  // ==========================================================
+  // 默认源
+  //
+  // 保持你原来的逻辑
+  // ==========================================================
+
   if (
     !apiUrl.searchParams.has(
       "source"
@@ -1031,7 +1162,10 @@ async function proxyApiRequest(
   }
 
 
-  // name / keywords 兼容
+  // ==========================================================
+  // name / keywords
+  // ==========================================================
+
   if (
     !apiUrl.searchParams.has(
       "name"
@@ -1057,56 +1191,23 @@ async function proxyApiRequest(
   }
 
 
-  console.log(
-    `[API] Request: ${apiUrl.toString()}`
-  );
-
-
   // ==========================================================
   // 请求 GD Studio
   // ==========================================================
 
-  let upstream: Response;
-
-
-  try {
-
-    upstream =
-      await fetch(
-        apiUrl.toString(),
-        {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-
-            "Accept":
-              "application/json",
-          },
-        }
-      );
-
-  } catch (err) {
-
-    console.error(
-      "[API] Fetch failed:",
-      err
-    );
-
-    return new Response(
-      "Upstream API fetch failed",
+  const upstream =
+    await fetch(
+      apiUrl.toString(),
       {
-        status: 502,
-
         headers: {
-          "Access-Control-Allow-Origin":
-            "*",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
 
-          "Content-Type":
-            "text/plain; charset=utf-8",
+          "Accept":
+            "application/json",
         },
       }
     );
-  }
 
 
   const responseText =
@@ -1140,12 +1241,12 @@ async function proxyApiRequest(
 
   headers.set(
     "Access-Control-Expose-Headers",
-    EXPOSED_HEADERS.join(", ")
+    "X-Cache-Status"
   );
 
 
   // ==========================================================
-  // 判断是否应该缓存
+  // 判断是否搜索
   // ==========================================================
 
   const isSearch =
@@ -1215,7 +1316,7 @@ async function proxyApiRequest(
 
 
   // ==========================================================
-  // 写入 Cloudflare Cache
+  // Cache PUT
   // ==========================================================
 
   if (
@@ -1283,14 +1384,6 @@ export async function onRequest({
       "Method not allowed",
       {
         status: 405,
-
-        headers: {
-          "Access-Control-Allow-Origin":
-            "*",
-
-          "Allow":
-            "GET, HEAD, OPTIONS",
-        },
       }
     );
   }
@@ -1321,11 +1414,15 @@ export async function onRequest({
 
 
   // ==========================================================
-  // 1. 酷我播放地址
+  // 酷我：获取播放地址
   //
-  // /proxy?types=url&source=kuwo&id=113118&br=320
+  // 注意：
+  // 只拦截：
   //
-  // 这里完全绕过 GD Studio 的 kuwo url 接口。
+  // types=url
+  // source=kuwo
+  //
+  // 其他 API 全部保持原来的 GD Studio 逻辑。
   // ==========================================================
 
   if (
@@ -1342,9 +1439,7 @@ export async function onRequest({
 
 
   // ==========================================================
-  // 2. 酷我实际音频代理
-  //
-  // /proxy?target=https://xxx.kuwo.cn/xxx.mp3
+  // 酷我：实际音频代理
   // ==========================================================
 
   if (target) {
@@ -1357,9 +1452,9 @@ export async function onRequest({
 
 
   // ==========================================================
-  // 3. 其他 API
+  // 其他所有 API
   //
-  // 网易云、JOOX、酷狗等继续走 GD Studio。
+  // 网易云在这里保持原来的处理方式。
   // ==========================================================
 
   return proxyApiRequest(
