@@ -98,7 +98,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   if (!apiUrl.searchParams.has("types")) return new Response("Missing types", { status: 400 });
 
-  // === 完整支持所有源（包括酷我音频直链）===
+  // === 支持所有源（包括酷我搜索，但 url 接口当前暂不支持）===
   if (!apiUrl.searchParams.has("source")) apiUrl.searchParams.set("source", "kuwo");
   if (!apiUrl.searchParams.has("name")) {
     const nameValue = url.searchParams.get("keywords") || url.searchParams.get("name");
@@ -120,7 +120,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   const isSearch = url.searchParams.get("types") === "search";
   const isEmptyResult = responseText.trim() === "[]";
-  const isError = responseText.includes('"error"') || responseText.includes('"status":0");
+  const isError = responseText.includes('"error"') || responseText.includes('"status":0');
 
   let shouldCache = upstream.status === 200 && request.method === "GET" && !isError;
   if (isSearch && isEmptyResult) shouldCache = false;
