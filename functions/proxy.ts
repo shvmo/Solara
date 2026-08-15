@@ -126,4 +126,32 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   if (isSearch && isEmptyResult) shouldCache = false;
 
   if (shouldCache) {
-    headers.set("
+    headers.set("Cache-Control", "public, s-maxage=300, max-age=300");
+  } else {
+    headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  }
+
+  const response = new Response(responseText, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+
+  if (shouldCache && waitUntil) {
+    waitUntil(cache.put(cacheKey, response.clone()));
+    console.log(`[Cache PUT] Saved to cache: ${url.toString()}`);
+  }
+
+  return response;
+}
+
+export async function onRequest({ request, waitUntil }: { request: Request, waitUntil: (promise: Promise<any>) => void }): Promise<Response> {
+  if (request.method === "OPTIONS") return handleOptions();
+  if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 });
+
+  const url = new URL(request.url);
+  const target = url.searchParams.get("target");
+  if (target) return proxyKuwoAudio(target, request);
+
+  return proxyApiRequest(url, request, waitUntil);
+}
