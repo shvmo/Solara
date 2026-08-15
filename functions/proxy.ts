@@ -98,8 +98,8 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   if (!apiUrl.searchParams.has("types")) return new Response("Missing types", { status: 400 });
 
-  // === 支持所有源 ===
-  if (!apiUrl.searchParams.has("source")) apiUrl.searchParams.set("source", "kugou"); // 默认酷狗
+  // 支持所有源（酷我、网易云、JOOX、酷狗等）
+  if (!apiUrl.searchParams.has("source")) apiUrl.searchParams.set("source", "kuwo");
   if (!apiUrl.searchParams.has("name")) {
     const nameValue = url.searchParams.get("keywords") || url.searchParams.get("name");
     if (nameValue) apiUrl.searchParams.set("name", nameValue);
@@ -120,38 +120,10 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   const isSearch = url.searchParams.get("types") === "search";
   const isEmptyResult = responseText.trim() === "[]";
-  const isError = responseText.includes('"error"') || responseText.includes('"status":0");
+  const isError = responseText.includes('"error"') || responseText.includes('"status":0');
 
   let shouldCache = upstream.status === 200 && request.method === "GET" && !isError;
   if (isSearch && isEmptyResult) shouldCache = false;
 
   if (shouldCache) {
-    headers.set("Cache-Control", "public, s-maxage=300, max-age=300");
-  } else {
-    headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
-  }
-
-  const response = new Response(responseText, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers,
-  });
-
-  if (shouldCache && waitUntil) {
-    waitUntil(cache.put(cacheKey, response.clone()));
-    console.log(`[Cache PUT] Saved to cache: ${url.toString()}`);
-  }
-
-  return response;
-}
-
-export async function onRequest({ request, waitUntil }: { request: Request, waitUntil: (promise: Promise<any>) => void }): Promise<Response> {
-  if (request.method === "OPTIONS") return handleOptions();
-  if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 });
-
-  const url = new URL(request.url);
-  const target = url.searchParams.get("target");
-  if (target) return proxyKuwoAudio(target, request);
-
-  return proxyApiRequest(url, request, waitUntil);
-}
+    headers.set("
