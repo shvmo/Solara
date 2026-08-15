@@ -38,32 +38,40 @@
 ---
 
 ### 🐳 Docker 一键部署 (适合私有服务器)
-无需下载和编译源码，只需在您的服务器上新建一个空白目录，创建 `docker-compose.yml` 文件，并复制填入以下内容：
+无需下载和编译源码，只需在您的服务器上新建一个空白目录，创建 `docker-compose.yml` 文件，并配置相应的端口映射（默认推荐宿主机端口为 `8080`，可根据需要自行修改，配合 Nginx 等反向代理或直接外网访问）：
+
+> [!NOTE]
+> **Docker 版高性能优化**：
+> 本镜像已切换为 **Express + Wrangler 混合双引擎架构**，由 Express 前台代理高频数据读写与音频流式管道传输（支持切歌时连接立即自动中止释放，防 Socket 泄漏），由后台 Wrangler 专职负责微量 API 代理（利用 BoringSSL 指纹完美绕过 Cloudflare 验证），从而兼顾极佳的性能、稳定性与 CF 验证通过率。
 
 ```yaml
-version: '3.8'
-
 services:
   solara:
     image: ghcr.io/akudamatata/solara:latest
     container_name: solara
     restart: always
+    init: true # 解决容器停止时 Node/Wrangler 进程无法优雅响应 SIGTERM 导致卡顿的问题
     ports:
-      - "80:8787"
+      - "8080:8787" # 宿主机端口:容器内端口（可将 8080 修改为其他未占用的宿主机端口）
     environment:
       # 在这里配置你的 Solara 登录口令
       - PASSWORD=your_secure_password_here
+      # 音乐聚合 API 地址（当默认 API 被 Cloudflare 屏蔽/Challenge 时，可更换为备用地址）
+      - API_BASE_URL=https://music-api.gdstudio.xyz/api.php
+      # 界面语言（默认中文，填 ENG 切换为英文）
+      # - language=ENG
     volumes:
-      # 持久化存储 D1 数据库（收藏夹和播放数据）
-      - ./data:/app/data
+      # 持久化 SQLite 数据库（收藏夹和播放记录）
+      - ./data:/data
 ```
+
+---
 
 保存文件后，在同一目录下打开终端，依次执行以下两条命令：
 ```bash
 docker compose pull
 docker compose up -d
 ```
-启动成功后，通过 `http://服务器IP:8787` 即可立即访问你的专属音乐播放器。
 
 ---
 
@@ -104,11 +112,13 @@ docker compose up -d
 
 ## 🔐 访问控制设置
 - **Cloudflare Pages：** 在项目的 **Settings → Functions → Environment variables** 中新增名为 `PASSWORD` 的环境变量，值为希望设置的访问口令。
-- 部署完成后，未登录的访问者会被自动重定向到 `/login` 页面并需输入该口令；若想关闭访问口令，删除该环境变量并重新部署即可。
+- **Docker 部署：** 在 `docker-compose.yml` 的 `environment` 中设置 `PASSWORD` 环境变量，例如 `- PASSWORD=your_password`。如果不需要密码，可不配置该变量。
+- 部署完成后，未登录的访问者会被自动重定向到 `/login` 页面并需输入该口令；若想关闭访问口令，删除该环境变量并重新部署或重启容器即可。
 
 ## 🌐 多语言设置 (English Version)
 - **Cloudflare Pages：** 在项目的 **Settings → Functions → Environment variables** 中新增名为 `LANGUAGE` 的环境变量，值为 `ENG`。
-- 部署完成后，站点将会自动切换为全英文界面。若想恢复中文界面，删除该环境变量或修改为其他值后重新部署即可。
+- **Docker 部署：** 在 `docker-compose.yml` 的 `environment` 中设置 `language` 环境变量为 `ENG`，即 `- language=ENG`（注意：Docker 环境下环境变量名是小写 `language`，以与 wrangler 本地开发环境一致）。
+- 部署完成后，站点将会自动切换为全英文界面。若想恢复中文界面，删除该环境变量或修改为其他值后重新部署或重启容器即可。
 
 ## 🎵 使用流程
 1. 输入关键词并选择想要的曲库后发起搜索。
@@ -158,6 +168,13 @@ Music-Player/
 ├── js/
 │   ├── index.js       # 播放器核心逻辑、状态管理与探索雷达分类
 │   └── mobile.js      # 移动端交互与事件处理
+├── server/            # Node.js 独立/流式 Express 服务器（Docker 版核心宿主）
+│   ├── routes/        # 服务器代理路由与取色分析逻辑
+│   ├── index.js       # Express 服务入口
+│   └── db.js          # 高性能 SQLite 数据库控制器 (WAL 模式)
+├── Dockerfile         # Docker 镜像构建文件（基于混合双引擎高性能服务形态）
+├── docker-entrypoint.sh # Docker 容器入口脚本（并行启动后台 Wrangler 与前台 Express）
+├── docker-compose.yml # Docker Compose 配置文件
 ├── favicon.png
 ├── favicon.svg
 ├── index.html         # 主界面结构、资源引入与配置项

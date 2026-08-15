@@ -5571,7 +5571,7 @@ function waitForAudioReady(player) {
 }
 
 async function playSong(song, options = {}) {
-    const { autoplay = true, startTime = 0, preserveProgress = false } = options;
+    const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false } = options;
 
     window.clearTimeout(pendingPaletteTimer);
     state.audioReadyForPalette = false;
@@ -5584,7 +5584,10 @@ async function playSong(song, options = {}) {
         updateCurrentSongInfo(song, { loadArtwork: false });
 
         const quality = state.playbackQuality || '320';
-        const audioUrl = API.getSongUrl(song, quality);
+        let audioUrl = API.getSongUrl(song, quality);
+        if (isRetry) {
+            audioUrl += '&nocache=true';
+        }
         debugLog(`获取音频URL: ${audioUrl}`);
 
         const audioData = await API.fetchJson(audioUrl);
@@ -5683,9 +5686,18 @@ async function playSong(song, options = {}) {
         if (autoplay) {
             playPromise = dom.audioPlayer.play();
             if (playPromise !== undefined) {
-                playPromise.catch(error => {
+                playPromise.catch(async error => {
                     console.error('播放失败:', error);
-                    showNotification('播放失败，请检查网络连接', 'error');
+                    if (!isRetry) {
+                        debugLog('音频播放遇到错误，尝试刷新缓存重试...');
+                        try {
+                            await playSong(song, { ...options, isRetry: true });
+                        } catch (retryError) {
+                            showNotification('播放失败，请检查网络连接', 'error');
+                        }
+                    } else {
+                        showNotification('播放失败，请检查网络连接', 'error');
+                    }
                 });
             } else {
                 playPromise = null;
@@ -5704,6 +5716,10 @@ async function playSong(song, options = {}) {
         }
     } catch (error) {
         console.error('播放歌曲失败:', error);
+        if (!isRetry) {
+            debugLog('播放歌曲失败，尝试刷新缓存重试...', error);
+            return playSong(song, { ...options, isRetry: true });
+        }
         throw error;
     } finally {
         savePlayerState();
