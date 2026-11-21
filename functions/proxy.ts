@@ -1,3 +1,5 @@
+import { toSimplified } from "./lib/traditional";
+
 const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
@@ -1114,9 +1116,12 @@ function pickJooxLink(
   br: number
 ): { url: string; tier: string } | null {
 
+  // 顺序按「体积合理 + 档位确实存在」排：
+  // 母带常有 100MB+，且 Hi-Res 并非每首都有（会 404），
+  // 所以优先给 CD 级无损 FLAC。
   const order =
     br >= 740
-      ? ["母带无损", "Hi-Res无损", "无损FLAC", "Atmos全景声", "OGG 320", "MP3 320", "AAC 192"]
+      ? ["无损FLAC", "Hi-Res无损", "母带无损", "Atmos全景声", "OGG 320", "MP3 320", "AAC 192"]
       : br >= 320
         ? ["MP3 320", "OGG 320", "AAC 192", "无损FLAC", "MP3 128"]
         : ["MP3 128", "AAC 96", "AAC 48"];
@@ -1276,6 +1281,60 @@ async function proxyJooxUrlRequest(
   );
 }
 
+
+// ============================================================
+// JOOX 歌词：港台曲库返回的是繁体，这里统一转成简体
+// ============================================================
+
+async function proxyJooxLyricRequest(
+  url: URL,
+  request: Request,
+  waitUntil?: (promise: Promise<any>) => void,
+  apiBaseUrl: string = DEFAULT_API_BASE_URL
+): Promise<Response> {
+
+  const primary = await proxyApiRequest(url, request, waitUntil, apiBaseUrl);
+
+  let body = "";
+
+  try {
+    body = await primary.clone().text();
+  } catch {
+    return primary;
+  }
+
+  let parsed: any = null;
+
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return primary;
+  }
+
+  if (!parsed || typeof parsed.lyric !== "string" || !parsed.lyric) {
+    return primary;
+  }
+
+  const simplified = toSimplified(parsed.lyric);
+
+  if (simplified === parsed.lyric) {
+    return primary;
+  }
+
+  const headers = new Headers();
+
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "public, max-age=3600");
+  headers.set("X-Cache-Status", primary.headers.get("X-Cache-Status") || "MISS");
+  headers.set("Access-Control-Expose-Headers", "X-Cache-Status, X-Joox-Fallback");
+
+  return new Response(
+    JSON.stringify({ ...parsed, lyric: simplified }),
+    { status: 200, headers }
+  );
+}
+
 async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void, apiBaseUrl: string = DEFAULT_API_BASE_URL): Promise<Response> {
   const cache = caches.default;
   
@@ -1420,6 +1479,11 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
     if (types === "url") {
       return proxyKuwoUrlRequest(url, request);
     }
+  }
+
+  // JOOX：歌词繁体转简体
+  if (types === "lyric" && source === "joox") {
+    return proxyJooxLyricRequest(url, request, waitUntil, apiBaseUrl);
   }
 
   // JOOX：GD 解析不出地址时，用歌名/歌手换解析服务再试
