@@ -1,4 +1,4 @@
-import { toSimplified } from "./lib/traditional";
+import { toSimplified, toTraditional } from "./lib/traditional";
 
 const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
@@ -1143,19 +1143,23 @@ async function resolveJooxUrlByFallback(
   br: number
 ): Promise<{ url: string; br: number; tier: string } | null> {
 
-  const targetName = normalizeSongName(name);
+  // 比拼统一在简体侧进行，避免上游返回繁体导致匹配失败
+  const targetName = normalizeSongName(toSimplified(name));
 
   if (!targetName) return null;
 
   const targetArtists = artist
     .split(/[/、,&]/)
-    .map(item => normalizeSongName(item))
+    .map(item => normalizeSongName(toSimplified(item)))
     .filter(Boolean);
+
+  // 备用解析服务的曲库是繁体索引，查询词要先转回繁体
+  const searchKeyword = toTraditional(name);
 
   for (let index = 1; index <= JOOX_FALLBACK_MAX_TRY; index++) {
 
     const apiUrl =
-      `${JOOX_FALLBACK_API}?msg=${encodeURIComponent(name)}` +
+      `${JOOX_FALLBACK_API}?msg=${encodeURIComponent(searchKeyword)}` +
       `&token=${JOOX_FALLBACK_TOKEN}&br=4&n=${index}`;
 
     let payload: any = null;
@@ -1178,7 +1182,7 @@ async function resolveJooxUrlByFallback(
 
     if (!data) break;
 
-    const hitName = normalizeSongName(data["歌曲名称"]);
+    const hitName = normalizeSongName(toSimplified(String(data["歌曲名称"] ?? "")));
 
     const nameHit =
       hitName === targetName ||
@@ -1189,7 +1193,7 @@ async function resolveJooxUrlByFallback(
     if (targetArtists.length) {
       const hitArtists = String(data["歌手"] || "")
         .split(/[/、,&]/)
-        .map(item => normalizeSongName(item))
+        .map(item => normalizeSongName(toSimplified(item)))
         .filter(Boolean);
 
       const artistHit = targetArtists.some(target =>
@@ -1333,6 +1337,75 @@ async function proxyJooxLyricRequest(
     JSON.stringify({ ...parsed, lyric: simplified }),
     { status: 200, headers }
   );
+}
+
+
+// ============================================================
+// JOOX 搜索：曲库元数据是繁体，统一转成简体再返回
+// ============================================================
+
+async function proxyJooxSearchRequest(
+  url: URL,
+  request: Request,
+  waitUntil?: (promise: Promise<any>) => void,
+  apiBaseUrl: string = DEFAULT_API_BASE_URL
+): Promise<Response> {
+
+  const primary = await proxyApiRequest(url, request, waitUntil, apiBaseUrl);
+
+  let body = "";
+
+  try {
+    body = await primary.clone().text();
+  } catch {
+    return primary;
+  }
+
+  let parsed: any = null;
+
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return primary;
+  }
+
+  if (!Array.isArray(parsed) || !parsed.length) {
+    return primary;
+  }
+
+  const converted = parsed.map((item: any) => {
+    if (!item || typeof item !== "object") return item;
+
+    const out: any = { ...item };
+
+    if (typeof out.name === "string") {
+      out.name = toSimplified(out.name);
+    }
+
+    if (typeof out.album === "string") {
+      out.album = toSimplified(out.album);
+    }
+
+    if (Array.isArray(out.artist)) {
+      out.artist = out.artist.map((name: any) =>
+        typeof name === "string" ? toSimplified(name) : name
+      );
+    } else if (typeof out.artist === "string") {
+      out.artist = toSimplified(out.artist);
+    }
+
+    return out;
+  });
+
+  const headers = new Headers();
+
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "public, max-age=300");
+  headers.set("X-Cache-Status", primary.headers.get("X-Cache-Status") || "MISS");
+  headers.set("Access-Control-Expose-Headers", "X-Cache-Status, X-Joox-Fallback");
+
+  return new Response(JSON.stringify(converted), { status: 200, headers });
 }
 
 async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void, apiBaseUrl: string = DEFAULT_API_BASE_URL): Promise<Response> {
@@ -1479,6 +1552,11 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
     if (types === "url") {
       return proxyKuwoUrlRequest(url, request);
     }
+  }
+
+  // JOOX：搜索结果是繁体，转简体（歌名/歌手/专辑）
+  if (types === "search" && source === "joox") {
+    return proxyJooxSearchRequest(url, request, waitUntil, apiBaseUrl);
   }
 
   // JOOX：歌词繁体转简体
