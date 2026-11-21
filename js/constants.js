@@ -232,7 +232,19 @@ export const API = {
 
     getSongUrl: (song, quality = "320") => {
         const signature = API.generateSignature();
-        return `${API.baseUrl}?types=url&id=${song.id}&source=${song.source || "netease"}&br=${quality}&s=${signature}`;
+
+        let url = `${API.baseUrl}?types=url&id=${song.id}&source=${song.source || "netease"}&br=${quality}&s=${signature}`;
+
+        // joox 解析失败时，服务端需要歌名/歌手才能兜底换解析服务
+        if ((song.source || "netease") === "joox" && song.name) {
+            url += `&name=${encodeURIComponent(song.name)}`;
+
+            if (song.artist) {
+                url += `&artist=${encodeURIComponent(String(song.artist))}`;
+            }
+        }
+
+        return url;
     },
 
     getLyric: (song) => {
